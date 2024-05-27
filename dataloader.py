@@ -1,6 +1,8 @@
 import torch
+from torch.utils.data import random_split
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
+import torch.nn.functional as F
 from PIL import Image
 import os
 
@@ -31,6 +33,7 @@ class VHRDataset(Dataset):
         
         boxes = []
         labels = []
+        confidences = []
         
         if img_type == 'positive':
             gt_path = os.path.join(self.gt_dir, os.path.basename(img_path).replace('.jpg', '.txt'))
@@ -43,8 +46,11 @@ class VHRDataset(Dataset):
                     y1, y2 = y1.strip(')').strip(), y2.strip(')').strip()
                     boxes.append([int(x1), int(y1), int(x2), int(y2)])
                     labels.append(int(a))
+                    confidences.append(1)
+        else:
+            confidences.append(0)
 
-        sample = {'image': image, 'boxes': boxes, 'labels': labels}
+        sample = {'image': image, 'boxes': boxes, 'confidences': confidences, 'labels': labels}
         if self.transform:
             sample = self.transform(sample)
 
@@ -56,7 +62,7 @@ class MyTransform:
         self.output_size = output_size
 
     def __call__(self, sample):
-        image, boxes, labels = sample['image'], sample['boxes'], sample['labels']
+        image, boxes, confidences, labels = sample['image'], sample['boxes'], sample['confidences'], sample['labels']
         w, h = image.size
         new_h, new_w = self.output_size if isinstance(self.output_size, tuple) else (self.output_size, self.output_size)
 
@@ -67,8 +73,8 @@ class MyTransform:
         new_boxes = []
         for box in boxes:
             scaled_box = [
-                box[0] * new_w / w, box[1] * new_h / h,
-                box[2] * new_w / w, box[3] * new_h / h
+                box[0] / w, box[1] / h,
+                box[2] / w, box[3] / h
             ]
             new_boxes.append(scaled_box)
 
@@ -76,36 +82,38 @@ class MyTransform:
         image = TF.to_tensor(image)
         image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        return {'image': image, 'boxes': torch.tensor(new_boxes, dtype=torch.float32), 'labels': torch.tensor(labels, dtype=torch.int8)}
+        return {'image': image, 'boxes': torch.tensor(new_boxes, dtype=torch.float32), 'confidences': torch.tensor(confidences, dtype=torch.int), 'labels': torch.tensor(labels, dtype=torch.int8)}
 
 # Used to combine several samples into a single batched tensor to be processed by the model.
 def collate_fn(batch):
     images = [item['image'] for item in batch]
     boxes = [item['boxes'] for item in batch]
+    confidences = [item['confidences'] for item in batch]
     labels = [item['labels'] for item in batch]
 
     # Pad boxes and labels to the maximum length so that they are of uniform size
     max_boxes_len = max(len(b) for b in boxes) # 25
     max_boxes = 67
     assert max_boxes_len <= max_boxes, f"Oh shit, {max_boxes_len} labels"
-    padded_boxes = []
-    padded_labels = []
-    for b, l in zip(boxes, labels):
-        if b.ndim == 2:
-            b = torch.nn.functional.pad(b, (0, 0, 0, max_boxes - b.size(0)))
-            l = torch.nn.functional.pad(l, (0, max_boxes - l.size(0)))
-        else:
-            b = torch.zeros((max_boxes, 4))
-            l = torch.zeros((max_boxes,  ))
-    
-        padded_boxes.append(b)
-        padded_labels.append(l)
-    
-    # Convert padded lists to tensors
-    padded_boxes = torch.stack(padded_boxes)
-    padded_labels = torch.stack(padded_labels)
 
-    return {'image': torch.stack(images), 'boxes': padded_boxes, 'labels': padded_labels}
+    # Padd the detections.
+    padded_boxes = torch.zeros((len(batch), max_boxes, 4), dtype=torch.float32)
+    padded_labels = torch.zeros((len(batch), max_boxes), dtype=torch.int64)
+    padded_confidences = torch.zeros((len(batch), max_boxes), dtype=torch.float32)
+
+    for i in range(len(batch)):
+        num_boxes = len(boxes[i])
+        if num_boxes > 0:
+            padded_boxes[i, :num_boxes] = torch.tensor(boxes[i], dtype=torch.float32)
+            padded_labels[i, :num_boxes] = torch.tensor(labels[i], dtype=torch.int64)
+            padded_confidences[i, :num_boxes] = torch.tensor(confidences[i], dtype=torch.float32)
+    
+    # One-hot encode the labels.
+    padded_one_hot_labels = F.one_hot(padded_labels, num_classes=11)
+
+    targets = torch.cat((padded_boxes, padded_confidences.unsqueeze(-1), padded_one_hot_labels), dim=-1)
+    images = torch.stack(images)
+    return images, targets
 
 dataset = VHRDataset(
     positive_img_dir='/home/dan/projects/cse4830/RI-CNN/NWPU VHR-10 dataset/positive image set',
@@ -114,6 +122,18 @@ dataset = VHRDataset(
     transform = MyTransform((512, 384))
 )
 
+total_size = len(dataset)
+train_size = int(0.6 * total_size)
+val_size = int(0.2 * total_size)
+test_size = total_size - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+    
+
 class MrDataHead(DataLoader):
     def __init__(self, dataset=dataset, batch_size=4, shuffle=True, collate_fn=collate_fn):
         super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+
+train_loader = MrDataHead(dataset=train_dataset, batch_size=4, shuffle=True)
+val_loader = MrDataHead(dataset=val_dataset, batch_size=4, shuffle=False)
+test_loader = MrDataHead(dataset=test_dataset, batch_size=4, shuffle=False)

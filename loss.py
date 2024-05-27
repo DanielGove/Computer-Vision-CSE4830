@@ -12,7 +12,7 @@ class DetectionLoss(nn.Module):
 
         # Split predictions
         pred_boxes = predictions[:, :, 0:4]
-        pred_confidence = predictions[:, :, 4]
+        pred_confidence = nn.functional.sigmoid(predictions[:, :, 4])
         pred_classes = predictions[:, :, 5:]
 
         # Split targets
@@ -26,10 +26,14 @@ class DetectionLoss(nn.Module):
         # Confidence loss - for all boxes
         confidence_loss = self.bce_loss(pred_confidence, target_confidence) / num_boxes
 
+        #print(pred_classes.shape)
+
         # Class loss - only for boxes with an object
-        class_loss = self.ce_loss(pred_classes, target_classes) * target_confidence
-        class_loss = class_loss.sum() / num_boxes
+        class_loss = self.ce_loss(pred_classes.view(-1, pred_classes.size(-1)), target_classes.view(-1))
+        class_loss = (class_loss * target_confidence).sum() / num_boxes
+
 
         # Combine losses
+        print(box_loss.item(), class_loss.item(), confidence_loss.item())
         total_loss = box_loss + confidence_loss + class_loss
         return total_loss
